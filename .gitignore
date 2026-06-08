@@ -1,0 +1,16 @@
+# Generated PDFs (per project instructions)
+*.pdf
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+.idea/
+
+# Large data is re-downloadable from NCEI by running the script; uncomment to skip committing:
+# data/*.csv
