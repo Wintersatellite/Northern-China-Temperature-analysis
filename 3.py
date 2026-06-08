@@ -1,0 +1,215 @@
+"""
+North China winter/annual temperature trends, 1960-present.
+Stations: Beijing, Tianjin, Shijiazhuang, Baoding (GHCN-Daily via NCEI).
+
+The NCEI Access Data Service needs NO API key. Run this on a machine that can
+reach www.ncei.noaa.gov (a normal internet connection; some sandboxes block it).
+
+Workflow:
+  1. (optional) verify_station_ids()  -> confirms the GHCN IDs + data coverage
+  2. main()                           -> fetches data, builds annual series,
+                                         makes figures, prints trend numbers
+"""
+import io
+import time
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import requests
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# city name -> GHCN-Daily station ID.  Verify these with verify_station_ids().
+STATIONS = {
+    "Hohhot":    "CHM00053463",
+    "Harbin":    "CHM00050953",
+    "Shenyang":  "CHM00054342",
+    "Changchun": "CHM00054161",
+}
+COLORS = {"Hohhot": "#1f6f8b", "Harbin": "#e1701a",
+          "Shenyang": "#5a9367", "Changchun": "#b4456b"}
+
+START, END = 1960, 2023          # analysis window (adjust to data availability)
+MIN_DAYS_PER_YEAR = 330          # require near-complete years
+ACCESS = "https://www.ncei.noaa.gov/access/services/data/v1"
+STATION_LIST = "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt"
+INVENTORY = "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-inventory.txt"
+
+plt.rcParams.update({"figure.dpi": 130, "savefig.dpi": 150, "savefig.bbox": "tight",
+    "font.size": 11, "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.alpha": 0.25, "axes.titleweight": "bold", "axes.titlesize": 12})
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (optional): verify the station IDs and see what years exist
+# ---------------------------------------------------------------------------
+def verify_station_ids():
+    """Look up our IDs in the GHCN station list + inventory and print a report.
+
+    Also greps the station list for the city names so you can spot a better
+    station if one of the defaults is wrong or has a short record.
+    """
+    stations = requests.get(STATION_LIST, timeout=60).text.splitlines()
+    inv = requests.get(INVENTORY, timeout=60).text.splitlines()
+
+    print("=== Our default IDs in the station list ===")
+    for city, sid in STATIONS.items():
+        hit = [ln for ln in stations if ln.startswith(sid)]
+        print(f"{city:13s} {sid}: {hit[0].strip() if hit else 'NOT FOUND'}")
+
+    print("\n=== TAVG/TMAX coverage (from inventory) ===")
+    for city, sid in STATIONS.items():
+        rows = [ln for ln in inv if ln.startswith(sid) and ln.split()[3] in ("TAVG", "TMAX")]
+        cov = "; ".join(f"{r.split()[3]} {r.split()[4]}-{r.split()[5]}" for r in rows)
+        print(f"{city:13s} {sid}: {cov or 'no TAVG/TMAX'}")
+
+    print("\n=== All stations whose name matches the four cities ===")
+    for key in ("HOHHOT", "HUHEHAOTE", "HARBIN", "SHENYANG", "CHANGCHUN"):
+        for ln in stations:
+            if key in ln.upper():
+                print(" ", ln.strip())
+
+
+# ---------------------------------------------------------------------------
+# Step 2: fetch one station's daily temperature data
+# ---------------------------------------------------------------------------
+def fetch_station(station_id, start=START, end=END):
+    """Return a daily DataFrame (DATE index, TMAX/TMIN/TAVG in C) for one station."""
+    params = {
+        "dataset":   "daily-summaries",
+        "stations":  station_id,
+        "startDate": f"{start}-01-01",
+        "endDate":   f"{end}-12-31",
+        "dataTypes": "TMAX,TMIN,TAVG",
+        "units":     "metric",            # Celsius
+        "format":    "csv",
+    }
+    for attempt in range(5):              # NCEI occasionally times out; retry
+        try:
+            r = requests.get(ACCESS, params=params, timeout=120)
+            r.raise_for_status()
+            break
+        except Exception as e:
+            if attempt == 4:
+                raise
+            time.sleep(3)
+    df = pd.read_csv(io.StringIO(r.text))
+    if "DATE" not in df.columns or len(df) == 0:
+        raise ValueError(f"no usable rows (columns returned: {list(df.columns)})")
+    # Parse the date column explicitly -- parse_dates in read_csv can silently
+    # leave it as text, which breaks the .dt accessor downstream.
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df = df.dropna(subset=["DATE"])
+    for col in ("TMAX", "TMIN", "TAVG"):
+        if col not in df:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Prefer reported TAVG; fall back to the (TMAX+TMIN)/2 midpoint.
+    df["tavg"] = df["TAVG"].where(df["TAVG"].notna(), (df["TMAX"] + df["TMIN"]) / 2)
+    out = df[["DATE", "tavg", "TMAX", "TMIN"]].dropna(subset=["tavg"])
+    if len(out) == 0:
+        raise ValueError("rows returned but no usable temperature values")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Step 3: build annual mean-temperature series per city
+# ---------------------------------------------------------------------------
+def annual_means():
+    series = {}
+    for city, sid in STATIONS.items():
+        try:
+            d = fetch_station(sid)
+        except Exception as e:
+            print(f"  WARNING: could not fetch {city} ({sid}): {e}")
+            continue
+        print(f"  {city}: fetched {len(d)} daily rows, "
+              f"{d['DATE'].min().date()} to {d['DATE'].max().date()}")
+        import os as _os; _os.makedirs("data", exist_ok=True)
+        d.to_csv(f"data/{city.lower()}.csv", index=False)   # save for the repo
+        d["year"] = d["DATE"].dt.year
+        g = d.groupby("year")
+        ann = pd.DataFrame({"tavg": g["tavg"].mean(), "n": g["tavg"].count()})
+        ann = ann[(ann.index >= START) & (ann.index <= END) & (ann["n"] >= MIN_DAYS_PER_YEAR)]
+        if len(ann) >= 10:
+            series[city] = ann["tavg"]
+            print(f"  {city}: {len(ann)} good years, {ann.index.min()}-{ann.index.max()}")
+        else:
+            print(f"  {city}: only {len(ann)} complete years -> skipped")
+    return series
+
+
+def trend_per_decade(years, vals):
+    m, b = np.polyfit(years, vals, 1)
+    return m * 10, m, b
+
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+def make_figures(series):
+    rates = {}
+
+    # Fig 1: annual mean temperature with trend lines
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for city, s in series.items():
+        ax.plot(s.index, s.values, color=COLORS[city], lw=1, alpha=0.45)
+        dec, m, b = trend_per_decade(s.index.values, s.values)
+        rates[city] = dec
+        ax.plot(s.index, m * s.index.values + b, color=COLORS[city], lw=2.2,
+                label=f"{city} ({dec:+.2f}\u00b0C/decade)")
+    ax.set_title(f"Annual mean temperature, North China cities, {START}\u2013{END}")
+    ax.set_xlabel("Year"); ax.set_ylabel("Annual mean temperature (\u00b0C)")
+    ax.legend(fontsize=9, frameon=False)
+    fig.savefig("images/cn_fig1_annual_temp.png"); plt.close(fig)
+
+    # Fig 2: warming rate per city
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    cs = sorted(rates, key=rates.get)
+    ax.barh(cs, [rates[c] for c in cs], color=[COLORS[c] for c in cs])
+    for i, c in enumerate(cs):
+        ax.text(rates[c], i, f" {rates[c]:+.2f}", va="center", fontsize=9)
+    ax.axvline(0, color="#444", lw=0.8)
+    ax.set_title(f"Warming rate by city, {START}\u2013{END}")
+    ax.set_xlabel("\u00b0C per decade")
+    fig.savefig("images/cn_fig2_warming_rate.png"); plt.close(fig)
+
+    # Fig 3: temperature anomaly vs each city's own baseline mean (comparable scale)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for city, s in series.items():
+        base = s[s.index < START + 20].mean()        # first-20-year baseline
+        anom = s - base
+        sm = anom.rolling(5, center=True, min_periods=3).mean()
+        ax.plot(sm.index, sm.values, color=COLORS[city], lw=2, label=city)
+    ax.axhline(0, color="#444", lw=0.8)
+    ax.set_title("Temperature anomaly vs each city's early-period baseline (5-yr smoothed)")
+    ax.set_xlabel("Year"); ax.set_ylabel("Anomaly (\u00b0C)")
+    ax.legend(fontsize=9, frameon=False, ncol=2)
+    fig.savefig("images/cn_fig3_anomaly.png"); plt.close(fig)
+
+    # numbers for the report
+    print("\nWarming rates (C/decade):")
+    for c in sorted(rates, key=rates.get):
+        print(f"  {c}: {rates[c]:+.2f}")
+    if rates:
+        print(f"Average: {np.mean(list(rates.values())):+.2f} C/decade")
+    return rates
+
+
+def main():
+    import os
+    os.makedirs("images", exist_ok=True)
+    print("Fetching annual means...")
+    series = annual_means()
+    if not series:
+        print("No data fetched -- check connectivity and run verify_station_ids().")
+        return
+    make_figures(series)
+    print("Saved figures to images/.")
+
+
+if __name__ == "__main__":
+    main()
